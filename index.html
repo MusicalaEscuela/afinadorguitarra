@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Afinador de Guitarra Musicala</title>
+  <meta name="description" content="Afinador PWA de guitarra para Musicala: preciso, simple e instalable." />
+  <meta name="theme-color" content="#070a18" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="MusiTuner" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/png" href="assets/icon-192.png" />
+  <link rel="apple-touch-icon" href="assets/icon-192.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div class="brand-block">
+        <img src="assets/logo.png" alt="Musicala" class="logo" />
+        <div>
+          <p class="eyebrow">Afinador PWA</p>
+          <h1>Afinador de Guitarra <span>Musicala</span></h1>
+        </div>
+      </div>
+      <div class="version" id="appVersion">v3</div>
+    </header>
+
+    <main class="layout">
+      <section class="panel controls-panel" aria-labelledby="controlsTitle">
+        <div class="panel-header">
+          <h2 id="controlsTitle">Control</h2>
+          <button id="btnReset" class="ghost-button" type="button">Restablecer</button>
+        </div>
+
+        <button id="btnMic" class="primary-button" type="button">Activar micrófono</button>
+        <p id="permissionHint" class="hint">Funciona en HTTPS, como GitHub Pages. En archivo local el micrófono suele bloquearse, porque los navegadores aman complicar lo obvio.</p>
+
+        <div class="field-grid">
+          <label class="field">
+            <span>Afinación</span>
+            <select id="tuningSelect"></select>
+          </label>
+
+          <label class="field">
+            <span>Calibración A4</span>
+            <div class="inline-control">
+              <input id="a4Input" type="range" min="430" max="450" step="1" value="440" />
+              <strong><span id="a4Value">440</span> Hz</strong>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Tolerancia</span>
+            <select id="toleranceSelect">
+              <option value="3">Pro · ±3 cents</option>
+              <option value="5" selected>Estándar · ±5 cents</option>
+              <option value="8">Principiante · ±8 cents</option>
+            </select>
+          </label>
+
+          <label class="field toggle-field">
+            <span>Sonido al afinar</span>
+            <label class="switch">
+              <input id="soundToggle" type="checkbox" checked />
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </label>
+        </div>
+
+        <div class="strings-head">
+          <h3>Cuerda</h3>
+          <p id="modeLabel">Automático</p>
+        </div>
+        <div id="stringButtons" class="string-buttons" aria-label="Selector de cuerda"></div>
+
+        <button id="btnGuided" class="guided-button" type="button">Modo guiado</button>
+      </section>
+
+      <section id="displayCard" class="panel tuner-card is-quiet" aria-live="polite">
+        <div class="target-row">
+          <div>
+            <p class="eyebrow">Objetivo</p>
+            <h2 id="targetString">6ª cuerda · E2</h2>
+          </div>
+          <div class="target-actions">
+            <strong id="targetFrequency">82.41 Hz</strong>
+            <button id="btnReference" class="reference-button" type="button">▶ Tono guía</button>
+          </div>
+        </div>
+
+        <div id="guidedPanel" class="guided-panel" hidden>
+          <div id="guidedProgress" class="guided-progress" aria-label="Progreso de afinación"></div>
+          <p id="guidedInstruction" class="guided-instruction">Toca la 6ª cuerda (E2) y afínala.</p>
+        </div>
+
+        <div class="dial-wrap" aria-label="Medidor de afinación en cents">
+          <svg class="dial" viewBox="0 0 320 215" role="img" aria-hidden="true">
+            <defs>
+              <linearGradient id="needleGrad" x1="0" y1="1" x2="0" y2="0">
+                <stop offset="0%" stop-color="#2d7dff" />
+                <stop offset="100%" stop-color="#72d8ff" />
+              </linearGradient>
+            </defs>
+            <path id="dialRim" class="dial-rim" />
+            <path id="dialZone" class="dial-zone" />
+            <g id="dialTicks"></g>
+            <g id="needle" class="dial-needle">
+              <line x1="160" y1="190" x2="160" y2="58" />
+              <circle cx="160" cy="190" r="9" />
+            </g>
+          </svg>
+
+          <div class="dial-center">
+            <p class="eyebrow">Detectado</p>
+            <div id="detectedNote" class="detected-note">--</div>
+            <div class="readout-stack">
+              <span id="detectedFrequency">0.00 Hz</span>
+              <strong><span id="centsValue">0.0</span> cents</strong>
+            </div>
+          </div>
+
+          <div id="needleReadout" class="needle-readout">0.0 cents</div>
+        </div>
+
+        <div class="result-box">
+          <p id="precisionText">Esperando señal</p>
+          <h3 id="advice">Activa el micrófono y toca una sola cuerda.</h3>
+        </div>
+
+        <div class="quality-grid" aria-label="Calidad de lectura">
+          <div class="quality-item">
+            <span>Señal</span>
+            <div class="mini-meter"><div id="signalFill"></div></div>
+            <strong id="signalText">sin señal</strong>
+          </div>
+          <div class="quality-item">
+            <span>Tono</span>
+            <div class="mini-meter"><div id="confidenceFill"></div></div>
+            <strong id="confidenceText">sin lectura</strong>
+          </div>
+          <div class="quality-item">
+            <span>Estabilidad</span>
+            <div class="mini-meter"><div id="stabilityFill"></div></div>
+            <strong id="stabilityText">sin estabilidad</strong>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <button id="installHint" class="install-button" hidden type="button">Instalar afinador</button>
+
+    <footer class="footer">
+      <strong>Consejo rápido:</strong> toca una cuerda a la vez, deja sonar la nota y ajusta en movimientos pequeños. La guitarra no negocia con la impaciencia, qué cosa tan sana.
+    </footer>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
