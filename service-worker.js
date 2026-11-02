@@ -1,10 +1,11 @@
-const CACHE_NAME = 'musicala-guitar-tuner-v4.0.0';
+const CACHE_NAME = 'musicala-guitar-tuner-v4.1.0';
 const ASSETS = [
   './',
   './index.html',
   './styles.css',
   './app.js',
   './pitch.js',
+  './tuner-worklet.js',
   './reference-tone.js',
   './tuner-config.js',
   './manifest.webmanifest',

@@ -1,0 +1,8 @@
+{
+  "name": "afinador-guitarra-musicala",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/accuracy-test.mjs"
+  }
+}

@@ -1,4 +1,4 @@
-export const APP_VERSION = '4.0.0';
+export const APP_VERSION = '4.1.0';
 
 export const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
 

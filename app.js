@@ -11,7 +11,7 @@ import {
   nearestGuitarString,
   noteNameFromNumber,
 } from './tuner-config.js';
-import { detectPitchYin, median, stdDev } from './pitch.js';
+import { analyzeFrame, median } from './pitch.js';
 import { ReferenceTone } from './reference-tone.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -58,6 +58,10 @@ const referenceTone = new ReferenceTone();
 const state = {
   audioContext: null,
   analyser: null,
+  worklet: null,
+  lastRms: 0,
+  attackUntil: 0,
+  lastStablePitch: null,
   source: null,
   highPass: null,
   lowPass: null,
@@ -95,7 +99,11 @@ function currentStrings() {
 const GUIDED_ORDER = [6, 5, 4, 3, 2, 1];
 const GUIDED_HOLD_TARGET = 9; // ~0.4 s sostenida en afinación antes de marcar ✓
 
-const HISTORY_LIMIT = 9;
+const HISTORY_LIMIT = 14;
+const FRAME_SIZE = 8192; // ~170 ms: la medición por fase compara sus dos mitades
+const FRAME_HOP = 2048; // un cuadro nuevo cada ~43 ms
+const ATTACK_RATIO = 1.8; // subida de volumen que se considera un nuevo ataque
+const ATTACK_SETTLE_MS = 120; // la cuerda suena alta justo después de pulsarla
 const UI_INTERVAL_MS = 45;
 const MIN_CONFIDENCE = 0.68;
 const NEEDLE_EASE = 0.22;
@@ -442,15 +450,30 @@ function computeStableReading() {
   const usable = state.history.filter((item) => item.confidence >= MIN_CONFIDENCE);
   if (!usable.length) return null;
 
-  const recent = usable.slice(-Math.min(6, usable.length));
-  const centsValues = recent.map((item) => item.cents);
-  const hzValues = recent.map((item) => item.pitch);
-  const confidenceValues = recent.map((item) => item.confidence);
+  const recent = usable.slice(-Math.min(10, usable.length));
+  const center = median(recent.map((item) => item.cents));
+  const deviations = recent.map((item) => Math.abs(item.cents - center));
+  // Descartar valores atípicos (MAD) antes de promediar.
+  const mad = Math.max(0.3, median(deviations));
+  const inliers = recent.filter((_, i) => deviations[i] <= 3 * mad + 0.5);
 
-  const cents = median(centsValues);
-  const pitch = median(hzValues);
-  const confidence = median(confidenceValues);
-  const spread = stdDev(centsValues);
+  // Media ponderada por confianza: más precisa que la mediana de cuadros solapados.
+  let weightSum = 0;
+  let centsSum = 0;
+  let pitchSum = 0;
+  let confidenceSum = 0;
+  inliers.forEach((item) => {
+    const weight = item.confidence * item.confidence;
+    weightSum += weight;
+    centsSum += weight * item.cents;
+    pitchSum += weight * item.pitch;
+    confidenceSum += item.confidence;
+  });
+
+  const cents = centsSum / weightSum;
+  const pitch = pitchSum / weightSum;
+  const confidence = confidenceSum / inliers.length;
+  const spread = Math.sqrt(inliers.reduce((acc, item) => acc + (item.cents - cents) ** 2, 0) / inliers.length);
   const stability = clamp(100 - spread * 13, 0, 100);
 
   return {
@@ -458,12 +481,20 @@ function computeStableReading() {
     pitch,
     confidence,
     stability,
-    sampleCount: recent.length,
-    isStable: recent.length >= 3 && spread <= 4.8 && confidence >= MIN_CONFIDENCE,
+    sampleCount: inliers.length,
+    isStable: inliers.length >= 3 && spread <= 2.5 && confidence >= MIN_CONFIDENCE,
   };
 }
 
 function renderReading(result) {
+  // Modo automático: si la lectura salta exactamente una octava respecto a la nota
+  // que veníamos midiendo, es un error de octava, no un cambio de cuerda.
+  if (state.selectedString === 'auto' && state.lastStablePitch) {
+    const octaves = Math.round(Math.log2(state.lastStablePitch / result.pitch));
+    const residual = 1200 * Math.log2((result.pitch * 2 ** octaves) / state.lastStablePitch);
+    if (octaves !== 0 && Math.abs(residual) < 60) result = { ...result, pitch: result.pitch * 2 ** octaves };
+  }
+
   const target = getTargetForPitch(result.pitch);
   const targetKey = getTargetKey(target);
   const cents = centsOff(result.pitch, target.hz);
@@ -480,6 +511,8 @@ function renderReading(result) {
     setWeakSignal(result);
     return;
   }
+
+  if (stable.isStable) state.lastStablePitch = stable.pitch;
 
   const absCents = Math.abs(stable.cents);
   const isInTune = absCents <= state.tolerance && stable.isStable;
@@ -552,24 +585,42 @@ function renderReading(result) {
   }
 }
 
+function processFrame(frame) {
+  if (!state.running || !state.audioContext) return;
+  const now = performance.now();
+  const sampleRate = state.audioContext.sampleRate;
+
+  const result = analyzeFrame(frame, sampleRate, {
+    minFrequency: 60,
+    maxFrequency: 420,
+    threshold: 0.115,
+    minRms: 0.006,
+    expectedHz: state.selectedString === 'auto' ? null : getManualTarget().hz,
+  });
+
+  // Nuevo ataque: descartar lo anterior e ignorar el tramo en que la cuerda suena alta.
+  if (result.rms > 0.006 && result.rms > state.lastRms * ATTACK_RATIO) {
+    state.attackUntil = now + (frame.length / sampleRate) * 1000 + ATTACK_SETTLE_MS;
+    state.lastStablePitch = null;
+    clearHistory();
+  }
+  state.lastRms = result.rms;
+  if (now < state.attackUntil) return;
+
+  if (result.pitch && result.confidence >= 0.45) {
+    renderReading(result);
+  } else {
+    setWeakSignal(result);
+  }
+}
+
+// Respaldo para navegadores sin AudioWorklet.
 function analysisLoop(timestamp = 0) {
   if (!state.running || !state.analyser) return;
 
   if (timestamp - state.lastUiUpdate >= UI_INTERVAL_MS) {
     state.analyser.getFloatTimeDomainData(state.buffer);
-    const result = detectPitchYin(state.buffer, state.audioContext.sampleRate, {
-      minFrequency: 60,
-      maxFrequency: 420,
-      threshold: 0.115,
-      minRms: 0.006,
-    });
-
-    if (result.pitch && result.confidence >= 0.45) {
-      renderReading(result);
-    } else {
-      setWeakSignal(result);
-    }
-
+    processFrame(state.buffer);
     state.lastUiUpdate = timestamp;
   }
 
@@ -623,14 +674,27 @@ async function startTuner() {
     state.lowPass.frequency.value = 900;
     state.lowPass.Q.value = 0.7;
 
-    state.analyser = state.audioContext.createAnalyser();
-    state.analyser.fftSize = 4096;
-    state.analyser.smoothingTimeConstant = 0;
-    state.buffer = new Float32Array(state.analyser.fftSize);
-
     state.source.connect(state.highPass);
     state.highPass.connect(state.lowPass);
-    state.lowPass.connect(state.analyser);
+
+    try {
+      await state.audioContext.audioWorklet.addModule('./tuner-worklet.js');
+      state.worklet = new AudioWorkletNode(state.audioContext, 'tuner-capture', {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        processorOptions: { frameSize: FRAME_SIZE, hop: FRAME_HOP },
+      });
+      state.worklet.port.onmessage = (event) => processFrame(event.data);
+      state.lowPass.connect(state.worklet);
+    } catch (workletError) {
+      console.warn('AudioWorklet no disponible, uso AnalyserNode.', workletError);
+      state.worklet = null;
+      state.analyser = state.audioContext.createAnalyser();
+      state.analyser.fftSize = FRAME_SIZE;
+      state.analyser.smoothingTimeConstant = 0;
+      state.buffer = new Float32Array(state.analyser.fftSize);
+      state.lowPass.connect(state.analyser);
+    }
 
     state.running = true;
     state.lastUiUpdate = 0;
@@ -638,7 +702,10 @@ async function startTuner() {
     ui.btnMic.classList.add('is-active');
     ui.permissionHint.textContent = 'Toca una cuerda a la vez. Para mayor precisión, deja que la nota suene limpia.';
     setVisualState('is-listening');
-    analysisLoop();
+    state.lastRms = 0;
+    state.attackUntil = 0;
+    state.lastStablePitch = null;
+    if (!state.worklet) analysisLoop();
   } catch (error) {
     console.error(error);
     ui.permissionHint.textContent = 'No se pudo activar el micrófono. Revisa permisos del navegador y vuelve a intentarlo.';
@@ -661,6 +728,8 @@ function stopTuner() {
   }
 
   state.audioContext = null;
+  if (state.worklet) state.worklet.port.onmessage = null;
+  state.worklet = null;
   state.analyser = null;
   state.source = null;
   state.highPass = null;
