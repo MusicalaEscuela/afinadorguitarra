@@ -1,852 +1,588 @@
+/*
+  Interfaz del afinador: estado, eventos y pintado.
+  Módulos: audio-engine.js (micrófono y análisis), pitch.js (detección),
+  reading.js (lectura estable), dial.js (medidor), instruments.js (catálogo),
+  tuner-config.js (matemática de notas), reference-tone.js (tono guía).
+*/
 import {
   APP_VERSION,
   DEFAULT_A4,
   DEFAULT_TOLERANCE,
-  DEFAULT_TUNING_ID,
-  TUNINGS,
+  buildStrings,
   centsOff,
-  getStringsForTuning,
-  getStringTargets,
   hzToNoteNumber,
-  nearestGuitarString,
-  noteNameFromNumber,
+  nearestNote,
+  nearestString,
+  noteParts,
 } from './tuner-config.js';
-import { analyzeFrame, median } from './pitch.js';
+import { DEFAULT_INSTRUMENT_ID, INSTRUMENTS, getDetectionRange, getInstrument, getTuning } from './instruments.js';
+import { TunerEngine } from './audio-engine.js';
+import { ReadingStabilizer } from './reading.js';
+import { Dial } from './dial.js';
 import { ReferenceTone } from './reference-tone.js';
 
 const $ = (selector) => document.querySelector(selector);
-const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 const ui = {
   appVersion: $('#appVersion'),
-  btnMic: $('#btnMic'),
-  btnReset: $('#btnReset'),
-  modeLabel: $('#modeLabel'),
-  stringButtons: $('#stringButtons'),
+  btnSettings: $('#btnSettings'),
+  settingsPanel: $('#settingsPanel'),
+  instrumentChips: $('#instrumentChips'),
+  tuningField: $('#tuningField'),
+  tuningSelect: $('#tuningSelect'),
+  toleranceSelect: $('#toleranceSelect'),
   a4Input: $('#a4Input'),
   a4Value: $('#a4Value'),
-  toleranceSelect: $('#toleranceSelect'),
-  tuningSelect: $('#tuningSelect'),
-  targetString: $('#targetString'),
+  namingSelect: $('#namingSelect'),
+  soundToggle: $('#soundToggle'),
+  btnReset: $('#btnReset'),
+  displayCard: $('#displayCard'),
+  targetEyebrow: $('#targetEyebrow'),
+  targetLabel: $('#targetLabel'),
   targetFrequency: $('#targetFrequency'),
+  btnReference: $('#btnReference'),
   detectedNote: $('#detectedNote'),
+  detectedOctave: $('#detectedOctave'),
   detectedFrequency: $('#detectedFrequency'),
   centsValue: $('#centsValue'),
-  advice: $('#advice'),
   precisionText: $('#precisionText'),
-  needle: $('#needle'),
-  needleReadout: $('#needleReadout'),
+  advice: $('#advice'),
+  guidedPanel: $('#guidedPanel'),
+  guidedInstruction: $('#guidedInstruction'),
+  stringsBlock: $('#stringsBlock'),
+  stringButtons: $('#stringButtons'),
+  modeLabel: $('#modeLabel'),
+  btnMic: $('#btnMic'),
+  btnMicLabel: $('#btnMicLabel'),
+  btnGuided: $('#btnGuided'),
+  permissionHint: $('#permissionHint'),
   signalFill: $('#signalFill'),
   confidenceFill: $('#confidenceFill'),
   stabilityFill: $('#stabilityFill'),
-  signalText: $('#signalText'),
-  confidenceText: $('#confidenceText'),
-  stabilityText: $('#stabilityText'),
-  permissionHint: $('#permissionHint'),
   installHint: $('#installHint'),
-  displayCard: $('#displayCard'),
-  soundToggle: $('#soundToggle'),
-  btnReference: $('#btnReference'),
-  btnGuided: $('#btnGuided'),
-  guidedPanel: $('#guidedPanel'),
-  guidedProgress: $('#guidedProgress'),
-  guidedInstruction: $('#guidedInstruction'),
 };
 
-const referenceTone = new ReferenceTone();
+const STORAGE_KEY = 'musicala-tuner-v5';
+const MIN_FRAME_CONFIDENCE = 0.45;
+const HOLD_MS = 1500; // la última lectura se queda visible un momento al apagarse la nota
+const GUIDED_HOLD_TARGET = 9; // ~0.4 s sostenida en afinación antes de marcar ✓
+const REFERENCE_MS = 3500;
+const VISUAL_STATES = ['is-in-tune', 'is-low', 'is-high', 'is-listening', 'is-quiet', 'is-unstable'];
 
-const state = {
-  audioContext: null,
-  analyser: null,
-  worklet: null,
-  lastRms: 0,
-  attackUntil: 0,
-  lastStablePitch: null,
-  source: null,
-  highPass: null,
-  lowPass: null,
-  stream: null,
-  buffer: null,
-  animationId: null,
-  running: false,
-  selectedString: 'auto',
+const DEFAULT_SETTINGS = {
+  instrumentId: DEFAULT_INSTRUMENT_ID,
+  tuningId: 'standard',
   a4: DEFAULT_A4,
   tolerance: DEFAULT_TOLERANCE,
-  history: [],
-  lastTargetKey: 'auto',
-  lastUiUpdate: 0,
-  needleCents: 0,
-  needleTargetCents: 0,
-  needleLocked: false,
-  needleAnimId: null,
-  lockFired: false,
+  latin: false,
   soundOn: true,
-  fxCtx: null,
-  referenceTimer: null,
-  guidedActive: false,
-  guidedStep: 0,
-  guidedDone: [],
-  guidedHold: 0,
-  tuningId: DEFAULT_TUNING_ID,
 };
 
-// Cuerdas de la afinación activa (6ª → 1ª).
-function currentStrings() {
-  return getStringsForTuning(state.tuningId);
-}
+const state = {
+  ...DEFAULT_SETTINGS,
+  ...loadSettings(),
+  selected: 'auto', // 'auto' o el índice de una cuerda
+  guided: { active: false, step: 0, done: [], hold: 0 },
+  lastTarget: null,
+  lastReadingAt: -Infinity,
+  lockFired: false,
+  referenceTimer: null,
+};
 
-// Orden del modo guiado: de la 6ª (más grave) a la 1ª (más aguda).
-const GUIDED_ORDER = [6, 5, 4, 3, 2, 1];
-const GUIDED_HOLD_TARGET = 9; // ~0.4 s sostenida en afinación antes de marcar ✓
+const dial = new Dial($('.dial'));
+const stabilizer = new ReadingStabilizer();
+const referenceTone = new ReferenceTone();
+const engine = new TunerEngine({
+  onResult: handleResult,
+  onAttack: () => stabilizer.reset(),
+});
 
-const HISTORY_LIMIT = 14;
-const FRAME_SIZE = 8192; // ~170 ms: la medición por fase compara sus dos mitades
-const FRAME_HOP = 2048; // un cuadro nuevo cada ~43 ms
-const ATTACK_RATIO = 1.8; // subida de volumen que se considera un nuevo ataque
-const ATTACK_SETTLE_MS = 120; // la cuerda suena alta justo después de pulsarla
-const UI_INTERVAL_MS = 45;
-const MIN_CONFIDENCE = 0.68;
-const NEEDLE_EASE = 0.22;
+// --- Ajustes guardados ----------------------------------------------------------
 
-// --- Geometría del dial radial ---
-const SVG_NS = 'http://www.w3.org/2000/svg';
-const DIAL_PIVOT_X = 160;
-const DIAL_PIVOT_Y = 190;
-const DIAL_ANGLE_MAX = 78; // grados a ±50 cents
-const DIAL_R_RIM = 150;
-const DIAL_R_TICK_OUT = 150;
-const DIAL_R_TICK_MINOR = 138;
-const DIAL_R_TICK_MAJOR = 126;
-const DIAL_R_LABEL = 112;
-const DIAL_ZONE_CENTS = 6; // banda verde central de referencia
-
-// Punto sobre el arco para un valor en cents y un radio dado.
-function dialPolar(cents, radius) {
-  const rad = (clamp(cents, -50, 50) / 50) * DIAL_ANGLE_MAX * (Math.PI / 180);
-  return {
-    x: DIAL_PIVOT_X + radius * Math.sin(rad),
-    y: DIAL_PIVOT_Y - radius * Math.cos(rad),
-  };
-}
-
-function dialArcPath(centsFrom, centsTo, radius) {
-  const a = dialPolar(centsFrom, radius);
-  const b = dialPolar(centsTo, radius);
-  return `M ${a.x.toFixed(2)} ${a.y.toFixed(2)} A ${radius} ${radius} 0 0 1 ${b.x.toFixed(2)} ${b.y.toFixed(2)}`;
-}
-
-function svgEl(name, attrs) {
-  const el = document.createElementNS(SVG_NS, name);
-  Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
-  return el;
-}
-
-function buildDial() {
-  const rim = document.querySelector('#dialRim');
-  const zone = document.querySelector('#dialZone');
-  const ticks = document.querySelector('#dialTicks');
-  if (!rim || !ticks) return;
-
-  rim.setAttribute('d', dialArcPath(-50, 50, DIAL_R_RIM));
-  zone.setAttribute('d', dialArcPath(-DIAL_ZONE_CENTS, DIAL_ZONE_CENTS, DIAL_R_RIM));
-
-  ticks.innerHTML = '';
-  for (let c = -50; c <= 50; c += 5) {
-    const major = c % 25 === 0;
-    const inner = dialPolar(c, major ? DIAL_R_TICK_MAJOR : DIAL_R_TICK_MINOR);
-    const outer = dialPolar(c, DIAL_R_TICK_OUT);
-    ticks.appendChild(svgEl('line', {
-      x1: inner.x.toFixed(2), y1: inner.y.toFixed(2),
-      x2: outer.x.toFixed(2), y2: outer.y.toFixed(2),
-      class: major ? 'tick major' : 'tick',
-    }));
-    if (major) {
-      const labelPos = dialPolar(c, DIAL_R_LABEL);
-      const label = svgEl('text', {
-        x: labelPos.x.toFixed(2), y: (labelPos.y + 4).toFixed(2), class: 'tick-label',
-      });
-      label.textContent = c > 0 ? `+${c}` : `${c}`;
-      ticks.appendChild(label);
-    }
+function loadSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+  } catch (_) {
+    return {};
   }
 }
 
-function setNeedle(cents) {
-  state.needleTargetCents = clamp(cents, -50, 50);
-  ui.needleReadout.textContent = `${cents >= 0 ? '+' : ''}${cents.toFixed(1)} cents`;
+function saveSettings() {
+  try {
+    const { instrumentId, tuningId, a4, tolerance, latin, soundOn } = state;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ instrumentId, tuningId, a4, tolerance, latin, soundOn }));
+  } catch (_) { /* sin almacenamiento: la app funciona igual */ }
 }
 
-function setNeedleLocked(locked) {
-  if (state.needleLocked === locked) return;
-  state.needleLocked = locked;
-  ui.needle.classList.toggle('is-locked', locked);
-}
+// --- Instrumento, cuerdas y objetivo --------------------------------------------
 
-// Loop continuo: interpola el ángulo de la aguja hacia el objetivo cada frame.
-// Convierte la precisión sub-cent en un barrido suave tipo aguja analógica.
-function needleLoop() {
-  state.needleCents += (state.needleTargetCents - state.needleCents) * NEEDLE_EASE;
-  if (Math.abs(state.needleTargetCents - state.needleCents) < 0.01) {
-    state.needleCents = state.needleTargetCents;
-  }
-  const angle = (state.needleCents / 50) * DIAL_ANGLE_MAX;
-  ui.needle.setAttribute('transform', `rotate(${angle.toFixed(2)} ${DIAL_PIVOT_X} ${DIAL_PIVOT_Y})`);
-  state.needleAnimId = requestAnimationFrame(needleLoop);
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function formatHz(value) {
   return `${value.toFixed(2)} Hz`;
 }
 
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
+// Cuerdas de la afinación activa, o null en modo cromático.
+function currentStrings() {
+  const tuning = getTuning(state.instrumentId, state.tuningId);
+  return tuning ? buildStrings(tuning.midis, state.a4, state.latin) : null;
 }
 
-function clearHistory() {
-  state.history = [];
+function selectedString() {
+  const strings = currentStrings();
+  if (!strings || state.selected === 'auto') return null;
+  return strings.find((string) => string.index === state.selected) || null;
 }
 
-function ensureFxAudio() {
-  if (!state.fxCtx) {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (Ctx) state.fxCtx = new Ctx();
-  }
-  if (state.fxCtx && state.fxCtx.state === 'suspended') state.fxCtx.resume();
-  return state.fxCtx;
+// Objetivo contra el que se mide una frecuencia.
+function targetForPitch(pitch) {
+  const strings = currentStrings();
+  if (!strings) return nearestNote(pitch, state.a4, state.latin);
+  return selectedString() || nearestString(pitch, strings);
 }
 
-// Confirmación al quedar afinada: háptico + tono suave opcional.
-// Permite afinar "a ciegas", sin mirar la pantalla.
-function triggerInTuneFeedback() {
-  if (navigator.vibrate) navigator.vibrate(28);
-  if (!state.soundOn) return;
-  const ctx = ensureFxAudio();
-  if (!ctx) return;
-  const now = ctx.currentTime;
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = 'sine';
-  osc.frequency.setValueAtTime(880, now);
-  gain.gain.setValueAtTime(0.0001, now);
-  gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.24);
-  osc.connect(gain).connect(ctx.destination);
-  osc.start(now);
-  osc.stop(now + 0.26);
+// Objetivo que se muestra cuando no suena nada.
+function restingTarget() {
+  const strings = currentStrings();
+  if (!strings) return nearestNote(state.a4, state.a4, state.latin);
+  return selectedString() || strings[0];
 }
 
-function setBars({ signal = 0, confidence = 0, stability = 0 }) {
+function syncEngineProfile() {
+  const manual = selectedString();
+  engine.setProfile({
+    ...getDetectionRange(state.instrumentId, state.tuningId, state.a4),
+    expectedHz: manual ? manual.hz : null,
+  });
+}
+
+// Se llama cuando cambia lo que se está afinando: limpia lecturas y repinta.
+function retarget() {
+  stabilizer.reset();
+  state.lastTarget = null;
+  state.lastReadingAt = -Infinity;
+  syncEngineProfile();
+  renderStringButtons();
+  renderTarget(restingTarget());
+  renderIdle();
+}
+
+// --- Pintado --------------------------------------------------------------------
+
+function setVisualState(type) {
+  ui.displayCard.classList.remove(...VISUAL_STATES);
+  ui.displayCard.classList.add(type);
+}
+
+function setBars(signal, confidence, stability) {
   ui.signalFill.style.width = `${clamp(signal, 0, 100)}%`;
   ui.confidenceFill.style.width = `${clamp(confidence, 0, 100)}%`;
   ui.stabilityFill.style.width = `${clamp(stability, 0, 100)}%`;
 }
 
-function getReferenceTarget() {
-  const targets = getStringTargets(state.a4, currentStrings());
-  if (state.guidedActive) {
-    const index = GUIDED_ORDER[state.guidedStep];
-    return targets.find((t) => t.index === index) || targets[0];
-  }
-  if (state.selectedString !== 'auto') {
-    return targets.find((t) => String(t.index) === String(state.selectedString)) || targets[0];
-  }
-  return targets[0];
-}
-
-function setReferenceButtonState(active) {
-  if (!ui.btnReference) return;
-  ui.btnReference.classList.toggle('is-playing', active);
-  ui.btnReference.textContent = active ? '⏸ Sonando' : '▶ Tono guía';
-}
-
-function playReference() {
-  const target = getReferenceTarget();
-  const playing = referenceTone.toggle(target.hz);
-  setReferenceButtonState(playing);
-
-  if (state.referenceTimer) clearTimeout(state.referenceTimer);
-  if (playing) {
-    // Auto-apagado para no interferir con la detección del micrófono.
-    state.referenceTimer = setTimeout(() => {
-      referenceTone.stop();
-      setReferenceButtonState(false);
-    }, 3500);
-  }
-}
-
-function stopReference() {
-  referenceTone.stop();
-  setReferenceButtonState(false);
-  if (state.referenceTimer) clearTimeout(state.referenceTimer);
-}
-
-function renderGuidedProgress() {
-  if (!ui.guidedProgress) return;
-  ui.guidedProgress.innerHTML = '';
-  GUIDED_ORDER.forEach((index, step) => {
-    const string = currentStrings().find((s) => s.index === index);
-    const dot = document.createElement('div');
-    dot.className = 'guided-dot';
-    if (state.guidedDone.includes(index)) dot.classList.add('done');
-    if (state.guidedActive && step === state.guidedStep) dot.classList.add('current');
-    dot.innerHTML = `<strong>${string.short}</strong><small>${string.note}</small>`;
-    ui.guidedProgress.appendChild(dot);
-  });
-}
-
-function updateGuidedInstruction() {
-  if (!ui.guidedInstruction) return;
-  if (state.guidedDone.length === GUIDED_ORDER.length) {
-    ui.guidedInstruction.textContent = '¡Las 6 cuerdas afinadas! Guitarra lista.';
-    return;
-  }
-  const index = GUIDED_ORDER[state.guidedStep];
-  const string = currentStrings().find((s) => s.index === index);
-  ui.guidedInstruction.textContent = `Toca la ${string.label} cuerda (${string.note}) y afínala.`;
-}
-
-function focusGuidedString() {
-  const index = GUIDED_ORDER[state.guidedStep];
-  state.selectedString = String(index);
-  state.guidedHold = 0;
-  clearHistory();
-  updateStringButtons();
-  updateTarget(getReferenceTarget());
-}
-
-function startGuided() {
-  state.guidedActive = true;
-  state.guidedStep = 0;
-  state.guidedDone = [];
-  state.guidedHold = 0;
-  ui.guidedPanel.hidden = false;
-  ui.btnGuided.classList.add('is-active');
-  ui.btnGuided.textContent = 'Salir del modo guiado';
-  focusGuidedString();
-  renderGuidedProgress();
-  updateGuidedInstruction();
-  ui.advice.textContent = 'Modo guiado: afina cada cuerda en orden, te aviso al pasar a la siguiente.';
-}
-
-function stopGuided() {
-  state.guidedActive = false;
-  state.guidedHold = 0;
-  ui.guidedPanel.hidden = true;
-  ui.btnGuided.classList.remove('is-active');
-  ui.btnGuided.textContent = 'Modo guiado';
-  renderGuidedProgress();
-}
-
-function advanceGuided() {
-  const index = GUIDED_ORDER[state.guidedStep];
-  if (!state.guidedDone.includes(index)) state.guidedDone.push(index);
-
-  if (state.guidedDone.length === GUIDED_ORDER.length) {
-    renderGuidedProgress();
-    updateGuidedInstruction();
-    if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-    return;
-  }
-
-  // Avanza al siguiente paso pendiente.
-  do {
-    state.guidedStep = (state.guidedStep + 1) % GUIDED_ORDER.length;
-  } while (state.guidedDone.includes(GUIDED_ORDER[state.guidedStep]));
-
-  focusGuidedString();
-  renderGuidedProgress();
-  updateGuidedInstruction();
-}
-
-function getManualTarget() {
-  const targets = getStringTargets(state.a4, currentStrings());
-  return targets.find((target) => String(target.index) === String(state.selectedString)) || targets[0];
-}
-
-function getTargetForPitch(pitch) {
-  if (state.selectedString === 'auto') {
-    return nearestGuitarString(pitch, state.a4, currentStrings()).target;
-  }
-  return getManualTarget();
-}
-
-function getTargetKey(target) {
-  return `${state.selectedString}:${target.index}:${state.a4}:${state.tuningId}`;
-}
-
-function updateStringButtons(activeTarget = null) {
-  $$('.string-button').forEach((button) => {
-    const isAuto = button.dataset.string === 'auto' && state.selectedString === 'auto';
-    const isManualSelected = button.dataset.string === String(state.selectedString);
-    const isDetected = activeTarget && button.dataset.string === String(activeTarget.index);
-
-    button.classList.toggle('selected', isAuto || isManualSelected);
-    button.classList.toggle('detected', isDetected);
-  });
-
-  ui.modeLabel.textContent = state.selectedString === 'auto'
-    ? 'Automático: toca una cuerda y la app la reconoce.'
-    : `Manual: afinando la ${getManualTarget().label} cuerda.`;
-}
-
-function updateTarget(target) {
-  ui.targetString.textContent = `${target.label} cuerda · ${target.note}`;
+function renderTarget(target) {
+  const chromatic = !currentStrings();
+  ui.targetEyebrow.textContent = chromatic ? 'Nota más cercana' : 'Objetivo';
+  ui.targetLabel.textContent = chromatic ? target.note : `${target.label} cuerda · ${target.note}`;
   ui.targetFrequency.textContent = formatHz(target.hz);
 }
 
-function setVisualState(type) {
-  ui.displayCard.classList.remove('is-in-tune', 'is-low', 'is-high', 'is-listening', 'is-quiet', 'is-unstable');
-  ui.displayCard.classList.add(type);
-}
-
-function setIdle(message = 'Activa el micrófono y toca una sola cuerda.') {
-  ui.detectedNote.textContent = '--';
-  ui.detectedFrequency.textContent = '0.00 Hz';
-  ui.centsValue.textContent = '0.0';
-  ui.precisionText.textContent = 'Esperando señal';
-  ui.advice.textContent = message;
-  setNeedle(0);
-  setBars({ signal: 0, confidence: 0, stability: 0 });
-  ui.signalText.textContent = 'sin señal';
-  ui.confidenceText.textContent = 'sin lectura';
-  ui.stabilityText.textContent = 'sin estabilidad';
-  setNeedleLocked(false);
-  state.lockFired = false;
-  setVisualState('is-quiet');
-}
-
-function setWeakSignal(result) {
-  clearHistory();
-  const signalScore = Math.round(clamp(result.rms * 1500, 0, 100));
-  setBars({ signal: signalScore, confidence: 0, stability: 0 });
-  ui.signalText.textContent = signalScore < 18 ? 'señal baja' : 'ruido o cuerda poco clara';
-  ui.confidenceText.textContent = 'sin tono confiable';
-  ui.stabilityText.textContent = 'esperando cuerda';
-  ui.detectedNote.textContent = '--';
-  ui.detectedFrequency.textContent = '0.00 Hz';
-  ui.centsValue.textContent = '0.0';
-  ui.precisionText.textContent = 'Toca una cuerda clara';
-  ui.advice.textContent = signalScore < 18
-    ? 'Acerca la guitarra al micrófono y toca una sola cuerda.'
-    : 'Evita hablar o rozar varias cuerdas al tiempo. Sí, el micrófono también se confunde, qué sorpresa.';
-  setNeedle(0);
-  setNeedleLocked(false);
-  state.lockFired = false;
-  setVisualState('is-quiet');
-  updateStringButtons(null);
-}
-
-function pushHistory(sample, targetKey) {
-  if (targetKey !== state.lastTargetKey) {
-    clearHistory();
-    state.lastTargetKey = targetKey;
-  }
-
-  state.history.push(sample);
-  if (state.history.length > HISTORY_LIMIT) state.history.shift();
-}
-
-function computeStableReading() {
-  const usable = state.history.filter((item) => item.confidence >= MIN_CONFIDENCE);
-  if (!usable.length) return null;
-
-  const recent = usable.slice(-Math.min(10, usable.length));
-  const center = median(recent.map((item) => item.cents));
-  const deviations = recent.map((item) => Math.abs(item.cents - center));
-  // Descartar valores atípicos (MAD) antes de promediar.
-  const mad = Math.max(0.3, median(deviations));
-  const inliers = recent.filter((_, i) => deviations[i] <= 3 * mad + 0.5);
-
-  // Media ponderada por confianza: más precisa que la mediana de cuadros solapados.
-  let weightSum = 0;
-  let centsSum = 0;
-  let pitchSum = 0;
-  let confidenceSum = 0;
-  inliers.forEach((item) => {
-    const weight = item.confidence * item.confidence;
-    weightSum += weight;
-    centsSum += weight * item.cents;
-    pitchSum += weight * item.pitch;
-    confidenceSum += item.confidence;
+function renderInstrumentChips() {
+  ui.instrumentChips.innerHTML = '';
+  INSTRUMENTS.forEach((instrument) => {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip';
+    chip.dataset.instrument = instrument.id;
+    chip.title = instrument.hint;
+    chip.textContent = instrument.name;
+    chip.setAttribute('aria-pressed', String(instrument.id === state.instrumentId));
+    ui.instrumentChips.appendChild(chip);
   });
+}
 
-  const cents = centsSum / weightSum;
-  const pitch = pitchSum / weightSum;
-  const confidence = confidenceSum / inliers.length;
-  const spread = Math.sqrt(inliers.reduce((acc, item) => acc + (item.cents - cents) ** 2, 0) / inliers.length);
-  const stability = clamp(100 - spread * 13, 0, 100);
+function renderTuningSelect() {
+  const instrument = getInstrument(state.instrumentId);
+  const tunings = instrument.tunings || [];
+  ui.tuningField.hidden = tunings.length < 2;
+  ui.tuningSelect.innerHTML = '';
+  tunings.forEach((tuning) => {
+    const option = document.createElement('option');
+    option.value = tuning.id;
+    option.textContent = `${tuning.name} · ${tuning.desc}`;
+    option.selected = tuning.id === state.tuningId;
+    ui.tuningSelect.appendChild(option);
+  });
+}
 
-  return {
-    cents,
-    pitch,
-    confidence,
-    stability,
-    sampleCount: inliers.length,
-    isStable: inliers.length >= 3 && spread <= 2.5 && confidence >= MIN_CONFIDENCE,
+function renderStringButtons(detected = null) {
+  const strings = currentStrings();
+  ui.stringsBlock.hidden = !strings;
+  ui.btnGuided.hidden = !strings;
+  if (!strings) return;
+
+  ui.stringButtons.innerHTML = '';
+  const addButton = (value, top, main) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'string-button';
+    button.dataset.string = value;
+    button.innerHTML = `<small>${top}</small><strong>${main}</strong>`;
+    button.classList.toggle('selected', state.selected === value);
+    button.classList.toggle('detected', Boolean(detected) && detected.index === value);
+    button.classList.toggle('done', state.guided.active && state.guided.done.includes(value));
+    ui.stringButtons.appendChild(button);
   };
+
+  addButton('auto', 'Todas', 'Auto');
+  strings.forEach((string) => addButton(string.index, string.label, string.short));
+
+  const manual = selectedString();
+  ui.modeLabel.textContent = manual
+    ? `Afinando solo la ${manual.label} cuerda (${manual.note}).`
+    : 'Automático: toca una cuerda y la reconozco.';
+}
+
+function renderIdle() {
+  ui.detectedNote.textContent = '--';
+  ui.detectedOctave.textContent = '';
+  ui.detectedFrequency.textContent = '— Hz';
+  ui.centsValue.textContent = '0.0';
+  dial.set(0);
+  dial.setLocked(false);
+  state.lockFired = false;
+  setBars(0, 0, 0);
+  ui.displayCard.classList.remove('is-holding');
+
+  if (engine.running) {
+    ui.precisionText.textContent = 'Escuchando';
+    ui.advice.textContent = currentStrings() ? 'Toca una sola cuerda y déjala sonar.' : 'Toca o canta una nota y mantenla.';
+    setVisualState('is-listening');
+  } else {
+    ui.precisionText.textContent = 'Esperando señal';
+    ui.advice.textContent = 'Activa el micrófono y toca una nota.';
+    setVisualState('is-quiet');
+  }
+}
+
+// Sin tono claro: se conserva la última lectura un momento para poder leerla.
+function renderNoSignal(result) {
+  const signal = result.rms * 1500;
+  if (performance.now() - state.lastReadingAt < HOLD_MS) {
+    setBars(signal, 0, 0);
+    ui.displayCard.classList.add('is-holding');
+    return;
+  }
+  if (state.lastTarget) {
+    stabilizer.reset();
+    state.lastTarget = null;
+    renderStringButtons();
+    renderTarget(restingTarget());
+  }
+  renderIdle();
+  setBars(signal, 0, 0);
+  if (signal >= 18) ui.advice.textContent = 'Hay sonido, pero no una nota clara. Toca una sola nota, sin ruido alrededor.';
+}
+
+function adviceFor(cents, absCents) {
+  const amount = absCents > 18 ? '' : ' un poco';
+  if (currentStrings()) {
+    return cents < 0
+      ? `Está${amount} baja: tensa la cuerda${absCents > 18 ? ' poco a poco' : ' suavemente'}.`
+      : `Está${amount} alta: afloja la cuerda${absCents > 18 ? ' poco a poco' : ' suavemente'}.`;
+  }
+  return cents < 0 ? `Está${amount} baja: sube la afinación.` : `Está${amount} alta: baja la afinación.`;
 }
 
 function renderReading(result) {
-  // Modo automático: si la lectura salta exactamente una octava respecto a la nota
-  // que veníamos midiendo, es un error de octava, no un cambio de cuerda.
-  if (state.selectedString === 'auto' && state.lastStablePitch) {
-    const octaves = Math.round(Math.log2(state.lastStablePitch / result.pitch));
-    const residual = 1200 * Math.log2((result.pitch * 2 ** octaves) / state.lastStablePitch);
-    if (octaves !== 0 && Math.abs(residual) < 60) result = { ...result, pitch: result.pitch * 2 ** octaves };
-  }
+  const manual = selectedString();
+  const pitch = manual ? result.pitch : stabilizer.foldOctave(result.pitch);
+  const target = targetForPitch(pitch);
 
-  const target = getTargetForPitch(result.pitch);
-  const targetKey = getTargetKey(target);
-  const cents = centsOff(result.pitch, target.hz);
-
-  pushHistory({
-    pitch: result.pitch,
-    cents,
+  stabilizer.push({
+    pitch,
+    cents: centsOff(pitch, target.hz),
     confidence: result.confidence,
-    time: performance.now(),
-  }, targetKey);
+  }, `${target.index}:${target.hz.toFixed(3)}`);
 
-  const stable = computeStableReading();
-  if (!stable) {
-    setWeakSignal(result);
-    return;
+  const stable = stabilizer.stable();
+  if (!stable) return;
+
+  state.lastReadingAt = performance.now();
+  ui.displayCard.classList.remove('is-holding');
+  if (!state.lastTarget || state.lastTarget.index !== target.index) {
+    state.lastTarget = target;
+    renderTarget(target);
+    renderStringButtons(target);
   }
 
-  if (stable.isStable) state.lastStablePitch = stable.pitch;
-
-  const absCents = Math.abs(stable.cents);
-  const isInTune = absCents <= state.tolerance && stable.isStable;
-  const isClose = absCents <= state.tolerance && !stable.isStable;
-  const isLow = stable.cents < -state.tolerance;
-  const isHigh = stable.cents > state.tolerance;
-
-  updateTarget(target);
-  updateStringButtons(target);
-
-  ui.detectedNote.textContent = noteNameFromNumber(hzToNoteNumber(stable.pitch, state.a4));
+  const heard = noteParts(hzToNoteNumber(stable.pitch, state.a4), state.latin);
+  ui.detectedNote.textContent = heard.name;
+  ui.detectedOctave.textContent = String(heard.octave);
   ui.detectedFrequency.textContent = formatHz(stable.pitch);
   ui.centsValue.textContent = `${stable.cents >= 0 ? '+' : ''}${stable.cents.toFixed(1)}`;
-  setNeedle(stable.cents);
+  dial.set(stable.cents);
+  setBars(result.rms * 1500, stable.confidence * 100, stable.stability);
 
-  const signalScore = Math.round(clamp(result.rms * 1500, 0, 100));
-  const confidenceScore = Math.round(stable.confidence * 100);
-  const stabilityScore = Math.round(stable.stability);
-  setBars({ signal: signalScore, confidence: confidenceScore, stability: stabilityScore });
+  const absCents = Math.abs(stable.cents);
+  const inRange = absCents <= state.tolerance;
 
-  ui.signalText.textContent = signalScore > 75 ? 'señal fuerte' : signalScore > 35 ? 'señal buena' : 'señal suave';
-  ui.confidenceText.textContent = confidenceScore > 85 ? 'tono claro' : confidenceScore > 70 ? 'tono usable' : 'tono dudoso';
-  ui.stabilityText.textContent = stable.isStable ? 'lectura estable' : 'estabilizando';
-
-  if (isInTune) {
-    ui.precisionText.textContent = `Afinada · ±${state.tolerance} cents`;
-    ui.advice.textContent = 'Afinada. Suelta esa cuerda antes de que la humanidad decida sobreafinarla por ansiedad.';
-    setNeedleLocked(true);
-    if (!state.lockFired) {
-      triggerInTuneFeedback();
-      state.lockFired = true;
-    }
+  if (inRange && stable.isStable) {
+    ui.precisionText.textContent = 'Afinada';
+    ui.advice.textContent = currentStrings() ? '¡Listo! Esta cuerda está afinada.' : '¡Listo! La nota está afinada.';
+    dial.setLocked(true);
     setVisualState('is-in-tune');
-
-    if (state.guidedActive && String(target.index) === String(GUIDED_ORDER[state.guidedStep])) {
-      state.guidedHold += 1;
-      if (state.guidedHold >= GUIDED_HOLD_TARGET && !state.guidedDone.includes(target.index)) {
-        advanceGuided();
-      }
+    if (!state.lockFired) {
+      state.lockFired = true;
+      if (navigator.vibrate) navigator.vibrate(28);
+      if (state.soundOn) referenceTone.chime();
     }
+    trackGuided(target);
     return;
   }
 
-  setNeedleLocked(false);
+  dial.setLocked(false);
   state.lockFired = false;
-  state.guidedHold = 0;
+  state.guided.hold = 0;
 
-  if (isClose) {
-    ui.precisionText.textContent = `Casi afinada · ±${state.tolerance} cents`;
-    ui.advice.textContent = 'Está en zona correcta, mantén el sonido un momento para confirmar.';
+  if (inRange) {
+    ui.precisionText.textContent = 'Casi';
+    ui.advice.textContent = 'Está en la zona correcta. Deja sonar la nota para confirmar.';
     setVisualState('is-unstable');
     return;
   }
 
-  if (isLow) {
-    ui.precisionText.textContent = absCents > 18 ? 'Baja' : 'Un poco baja';
-    ui.advice.textContent = absCents > 18
-      ? 'Está baja: sube la tensión de la cuerda poco a poco.'
-      : 'Un poquito baja: ajusta suave hacia arriba.';
-    setVisualState('is-low');
+  const low = stable.cents < 0;
+  ui.precisionText.textContent = `${absCents > 18 ? '' : 'Un poco '}${low ? 'baja' : 'alta'}`.replace(/^./, (c) => c.toUpperCase());
+  ui.advice.textContent = adviceFor(stable.cents, absCents);
+  setVisualState(low ? 'is-low' : 'is-high');
+}
+
+function handleResult(result) {
+  if (result.pitch && result.confidence >= MIN_FRAME_CONFIDENCE) renderReading(result);
+  else renderNoSignal(result);
+}
+
+// --- Tono guía ------------------------------------------------------------------
+
+function setReferenceButton(playing) {
+  ui.btnReference.classList.toggle('is-playing', playing);
+  ui.btnReference.textContent = playing ? '■ Sonando' : '▶ Tono guía';
+}
+
+function stopReference() {
+  referenceTone.stop();
+  setReferenceButton(false);
+  clearTimeout(state.referenceTimer);
+}
+
+function toggleReference() {
+  const target = selectedString() || state.lastTarget || restingTarget();
+  const playing = referenceTone.toggle(target.hz);
+  setReferenceButton(playing);
+  clearTimeout(state.referenceTimer);
+  // Se apaga solo para no interferir con el micrófono.
+  if (playing) state.referenceTimer = setTimeout(stopReference, REFERENCE_MS);
+}
+
+// --- Modo guiado: cuerda por cuerda ---------------------------------------------
+
+function renderGuided() {
+  const strings = currentStrings();
+  ui.guidedPanel.hidden = !state.guided.active;
+  ui.btnGuided.classList.toggle('is-active', state.guided.active);
+  ui.btnGuided.textContent = state.guided.active ? 'Salir del modo guiado' : 'Modo guiado';
+  if (!state.guided.active || !strings) return;
+
+  if (state.guided.done.length === strings.length) {
+    ui.guidedInstruction.textContent = `¡Las ${strings.length} cuerdas están afinadas!`;
     return;
   }
-
-  if (isHigh) {
-    ui.precisionText.textContent = absCents > 18 ? 'Alta' : 'Un poco alta';
-    ui.advice.textContent = absCents > 18
-      ? 'Está alta: baja la tensión de la cuerda poco a poco.'
-      : 'Un poquito alta: ajusta suave hacia abajo.';
-    setVisualState('is-high');
-  }
+  const string = strings[state.guided.step];
+  ui.guidedInstruction.textContent = `Paso ${state.guided.done.length + 1} de ${strings.length}: toca la ${string.label} cuerda (${string.note}).`;
 }
 
-function processFrame(frame) {
-  if (!state.running || !state.audioContext) return;
-  const now = performance.now();
-  const sampleRate = state.audioContext.sampleRate;
-
-  const result = analyzeFrame(frame, sampleRate, {
-    minFrequency: 60,
-    maxFrequency: 420,
-    threshold: 0.115,
-    minRms: 0.006,
-    expectedHz: state.selectedString === 'auto' ? null : getManualTarget().hz,
-  });
-
-  // Nuevo ataque: descartar lo anterior e ignorar el tramo en que la cuerda suena alta.
-  if (result.rms > 0.006 && result.rms > state.lastRms * ATTACK_RATIO) {
-    state.attackUntil = now + (frame.length / sampleRate) * 1000 + ATTACK_SETTLE_MS;
-    state.lastStablePitch = null;
-    clearHistory();
-  }
-  state.lastRms = result.rms;
-  if (now < state.attackUntil) return;
-
-  if (result.pitch && result.confidence >= 0.45) {
-    renderReading(result);
-  } else {
-    setWeakSignal(result);
-  }
+function focusGuidedStep() {
+  state.selected = currentStrings()[state.guided.step].index;
+  state.guided.hold = 0;
+  retarget();
+  renderGuided();
 }
 
-// Respaldo para navegadores sin AudioWorklet.
-function analysisLoop(timestamp = 0) {
-  if (!state.running || !state.analyser) return;
-
-  if (timestamp - state.lastUiUpdate >= UI_INTERVAL_MS) {
-    state.analyser.getFloatTimeDomainData(state.buffer);
-    processFrame(state.buffer);
-    state.lastUiUpdate = timestamp;
-  }
-
-  state.animationId = requestAnimationFrame(analysisLoop);
+function startGuided() {
+  state.guided = { active: true, step: 0, done: [], hold: 0 };
+  focusGuidedStep();
 }
 
-async function requestMicrophone() {
-  const constraints = {
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-      channelCount: 1,
-    },
-  };
+function stopGuided() {
+  if (!state.guided.active) return;
+  state.guided = { active: false, step: 0, done: [], hold: 0 };
+  state.selected = 'auto';
+  renderGuided();
+  retarget();
+}
 
-  try {
-    return await navigator.mediaDevices.getUserMedia(constraints);
-  } catch (error) {
-    return navigator.mediaDevices.getUserMedia({ audio: true });
+// Cuenta cuánto tiempo lleva afinada la cuerda del paso actual y avanza.
+function trackGuided(target) {
+  const { guided } = state;
+  const strings = currentStrings();
+  if (!guided.active || !strings || guided.done.includes(target.index)) return;
+  if (target.index !== strings[guided.step].index) return;
+
+  guided.hold += 1;
+  if (guided.hold < GUIDED_HOLD_TARGET) return;
+
+  guided.done.push(target.index);
+  if (guided.done.length === strings.length) {
+    if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+    renderStringButtons(target);
+    renderGuided();
+    return;
   }
+  guided.step += 1;
+  focusGuidedStep();
+}
+
+// --- Micrófono ------------------------------------------------------------------
+
+function renderMicButton() {
+  ui.btnMic.classList.toggle('is-active', engine.running);
+  ui.btnMicLabel.textContent = engine.running ? 'Detener micrófono' : 'Activar micrófono';
 }
 
 async function startTuner() {
-  if (state.running) return;
-
   if (!navigator.mediaDevices?.getUserMedia) {
-    ui.permissionHint.textContent = 'Este navegador no permite micrófono web. Usa Chrome, Edge o Safari actualizado.';
+    ui.permissionHint.textContent = 'Este navegador no permite usar el micrófono. Prueba con Chrome, Edge o Safari actualizado.';
     return;
   }
-
-  if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-    ui.permissionHint.textContent = 'El micrófono requiere HTTPS. Sube el proyecto a GitHub Pages o ábrelo en localhost.';
+  if (!window.isSecureContext) {
+    ui.permissionHint.textContent = 'El micrófono solo funciona en una dirección HTTPS o en localhost.';
     return;
   }
 
   try {
-    state.audioContext = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
-    state.stream = await requestMicrophone();
-
-    if (state.audioContext.state === 'suspended') await state.audioContext.resume();
-
-    state.source = state.audioContext.createMediaStreamSource(state.stream);
-    state.highPass = state.audioContext.createBiquadFilter();
-    state.highPass.type = 'highpass';
-    state.highPass.frequency.value = 55;
-    state.highPass.Q.value = 0.7;
-
-    state.lowPass = state.audioContext.createBiquadFilter();
-    state.lowPass.type = 'lowpass';
-    state.lowPass.frequency.value = 900;
-    state.lowPass.Q.value = 0.7;
-
-    state.source.connect(state.highPass);
-    state.highPass.connect(state.lowPass);
-
-    try {
-      await state.audioContext.audioWorklet.addModule('./tuner-worklet.js');
-      state.worklet = new AudioWorkletNode(state.audioContext, 'tuner-capture', {
-        numberOfInputs: 1,
-        numberOfOutputs: 0,
-        processorOptions: { frameSize: FRAME_SIZE, hop: FRAME_HOP },
-      });
-      state.worklet.port.onmessage = (event) => processFrame(event.data);
-      state.lowPass.connect(state.worklet);
-    } catch (workletError) {
-      console.warn('AudioWorklet no disponible, uso AnalyserNode.', workletError);
-      state.worklet = null;
-      state.analyser = state.audioContext.createAnalyser();
-      state.analyser.fftSize = FRAME_SIZE;
-      state.analyser.smoothingTimeConstant = 0;
-      state.buffer = new Float32Array(state.analyser.fftSize);
-      state.lowPass.connect(state.analyser);
-    }
-
-    state.running = true;
-    state.lastUiUpdate = 0;
-    ui.btnMic.textContent = 'Micrófono activo';
-    ui.btnMic.classList.add('is-active');
-    ui.permissionHint.textContent = 'Toca una cuerda a la vez. Para mayor precisión, deja que la nota suene limpia.';
-    setVisualState('is-listening');
-    state.lastRms = 0;
-    state.attackUntil = 0;
-    state.lastStablePitch = null;
-    if (!state.worklet) analysisLoop();
+    await engine.start();
+    ui.permissionHint.textContent = '';
   } catch (error) {
     console.error(error);
-    ui.permissionHint.textContent = 'No se pudo activar el micrófono. Revisa permisos del navegador y vuelve a intentarlo.';
-    setIdle('No se pudo activar el micrófono. Cosas de navegadores, esos seres temperamentales.');
+    ui.permissionHint.textContent = 'No se pudo activar el micrófono. Revisa el permiso en el navegador y vuelve a intentarlo.';
   }
+  stabilizer.reset();
+  renderMicButton();
+  renderIdle();
 }
 
 function stopTuner() {
-  if (state.animationId) cancelAnimationFrame(state.animationId);
-  state.animationId = null;
-  state.running = false;
-  clearHistory();
-
-  if (state.stream) {
-    state.stream.getTracks().forEach((track) => track.stop());
-  }
-
-  if (state.audioContext && state.audioContext.state !== 'closed') {
-    state.audioContext.close();
-  }
-
-  state.audioContext = null;
-  if (state.worklet) state.worklet.port.onmessage = null;
-  state.worklet = null;
-  state.analyser = null;
-  state.source = null;
-  state.highPass = null;
-  state.lowPass = null;
-  state.stream = null;
-  state.buffer = null;
-
-  ui.btnMic.textContent = 'Activar micrófono';
-  ui.btnMic.classList.remove('is-active');
-  setIdle();
+  engine.stop();
+  stabilizer.reset();
+  state.lastTarget = null;
+  state.lastReadingAt = -Infinity;
+  renderMicButton();
+  renderIdle();
 }
 
-function buildStringButtons() {
-  ui.stringButtons.innerHTML = '';
+// --- Eventos --------------------------------------------------------------------
 
-  const autoButton = document.createElement('button');
-  autoButton.type = 'button';
-  autoButton.className = 'string-button';
-  autoButton.dataset.string = 'auto';
-  autoButton.innerHTML = '<span>Auto</span><strong>Reconocer</strong>';
-  ui.stringButtons.appendChild(autoButton);
+function selectInstrument(instrumentId) {
+  if (state.guided.active) state.guided = { active: false, step: 0, done: [], hold: 0 };
+  stopReference();
+  state.instrumentId = instrumentId;
+  state.tuningId = (getTuning(instrumentId, 'standard') || {}).id || 'standard';
+  state.selected = 'auto';
+  saveSettings();
+  renderInstrumentChips();
+  renderTuningSelect();
+  renderGuided();
+  retarget();
+}
 
-  currentStrings().forEach((string) => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'string-button';
-    button.dataset.string = String(string.index);
-    button.innerHTML = `
-      <span>${string.label} · ${string.note}</span>
-      <strong>${string.short}</strong>
-      <small>${string.hint}</small>
-    `;
-    ui.stringButtons.appendChild(button);
-  });
+function applySettingsToControls() {
+  ui.toleranceSelect.value = String(state.tolerance);
+  ui.a4Input.value = String(state.a4);
+  ui.a4Value.textContent = String(state.a4);
+  ui.namingSelect.value = state.latin ? 'latin' : 'letters';
+  ui.soundToggle.checked = state.soundOn;
+  dial.setTolerance(state.tolerance);
 }
 
 function bindEvents() {
-  ui.btnMic.addEventListener('click', () => {
-    if (state.running) stopTuner();
-    else startTuner();
+  ui.btnMic.addEventListener('click', () => (engine.running ? stopTuner() : startTuner()));
+
+  ui.btnSettings.addEventListener('click', () => {
+    const open = ui.settingsPanel.hidden;
+    ui.settingsPanel.hidden = !open;
+    ui.btnSettings.setAttribute('aria-expanded', String(open));
   });
 
-  ui.btnReset.addEventListener('click', () => {
-    stopGuided();
+  ui.instrumentChips.addEventListener('click', (event) => {
+    const chip = event.target.closest('.chip');
+    if (chip && chip.dataset.instrument !== state.instrumentId) selectInstrument(chip.dataset.instrument);
+  });
+
+  ui.tuningSelect.addEventListener('change', (event) => {
+    state.tuningId = event.target.value;
+    state.selected = 'auto';
+    state.guided = { active: false, step: 0, done: [], hold: 0 };
     stopReference();
-    state.a4 = DEFAULT_A4;
-    state.tolerance = DEFAULT_TOLERANCE;
-    state.selectedString = 'auto';
-    state.tuningId = DEFAULT_TUNING_ID;
-    ui.a4Input.value = String(DEFAULT_A4);
-    ui.a4Value.textContent = String(DEFAULT_A4);
-    ui.toleranceSelect.value = String(DEFAULT_TOLERANCE);
-    if (ui.tuningSelect) ui.tuningSelect.value = DEFAULT_TUNING_ID;
-    clearHistory();
-    buildStringButtons();
-    updateStringButtons();
-    updateTarget(getStringTargets(state.a4, currentStrings())[0]);
-    setIdle('Ajustes restablecidos. Ahora sí, de vuelta a la civilización tonal.');
+    saveSettings();
+    renderGuided();
+    retarget();
+  });
+
+  ui.toleranceSelect.addEventListener('change', (event) => {
+    state.tolerance = Number(event.target.value) || DEFAULT_TOLERANCE;
+    dial.setTolerance(state.tolerance);
+    saveSettings();
   });
 
   ui.a4Input.addEventListener('input', (event) => {
     state.a4 = Number(event.target.value) || DEFAULT_A4;
     ui.a4Value.textContent = String(state.a4);
-    clearHistory();
-    const target = state.selectedString === 'auto' ? getStringTargets(state.a4, currentStrings())[0] : getManualTarget();
-    updateTarget(target);
+    saveSettings();
+    retarget();
   });
 
-  ui.toleranceSelect.addEventListener('change', (event) => {
-    state.tolerance = Number(event.target.value) || DEFAULT_TOLERANCE;
-    clearHistory();
+  ui.namingSelect.addEventListener('change', (event) => {
+    state.latin = event.target.value === 'latin';
+    saveSettings();
+    renderGuided();
+    retarget();
   });
 
-  ui.tuningSelect?.addEventListener('change', (event) => {
-    state.tuningId = event.target.value;
-    state.selectedString = 'auto';
-    stopGuided();
-    stopReference();
-    clearHistory();
-    buildStringButtons();
-    updateStringButtons();
-    updateTarget(getStringTargets(state.a4, currentStrings())[0]);
-    const tuning = TUNINGS.find((t) => t.id === state.tuningId);
-    ui.advice.textContent = `Afinación ${tuning.name} (${tuning.desc}). Toca una cuerda.`;
-  });
-
-  ui.soundToggle?.addEventListener('change', (event) => {
+  ui.soundToggle.addEventListener('change', (event) => {
     state.soundOn = event.target.checked;
-    if (state.soundOn) ensureFxAudio();
+    saveSettings();
   });
 
-  ui.btnReference?.addEventListener('click', playReference);
-
-  ui.btnGuided?.addEventListener('click', () => {
-    if (state.guidedActive) stopGuided();
-    else startGuided();
+  ui.btnReset.addEventListener('click', () => {
+    const { instrumentId } = state;
+    Object.assign(state, DEFAULT_SETTINGS, { instrumentId });
+    applySettingsToControls();
+    selectInstrument(instrumentId);
   });
+
+  ui.btnReference.addEventListener('click', toggleReference);
+
+  ui.btnGuided.addEventListener('click', () => (state.guided.active ? stopGuided() : startGuided()));
 
   ui.stringButtons.addEventListener('click', (event) => {
     const button = event.target.closest('.string-button');
     if (!button) return;
-    if (state.guidedActive) stopGuided();
-    state.selectedString = button.dataset.string;
-    clearHistory();
-    updateStringButtons();
-    const target = state.selectedString === 'auto' ? getStringTargets(state.a4, currentStrings())[0] : getManualTarget();
-    updateTarget(target);
-    ui.advice.textContent = state.selectedString === 'auto'
-      ? 'Modo automático activo: toca una sola cuerda.'
-      : `Toca la ${target.label} cuerda (${target.note}).`;
+    if (state.guided.active) {
+      state.guided = { active: false, step: 0, done: [], hold: 0 };
+      renderGuided();
+    }
+    state.selected = button.dataset.string;
+    retarget();
   });
 }
 
-async function registerServiceWorker() {
-  if (!('serviceWorker' in navigator)) return;
-  if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') return;
+// --- PWA ------------------------------------------------------------------------
 
+async function registerServiceWorker() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
   try {
     await navigator.serviceWorker.register('./service-worker.js');
   } catch (error) {
@@ -855,46 +591,37 @@ async function registerServiceWorker() {
 }
 
 function setupInstallHint() {
+  let installPrompt = null;
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
-    window.deferredInstallPrompt = event;
+    installPrompt = event;
     ui.installHint.hidden = false;
   });
 
-  ui.installHint?.addEventListener('click', async () => {
-    const prompt = window.deferredInstallPrompt;
-    if (!prompt) return;
-    prompt.prompt();
-    await prompt.userChoice;
-    window.deferredInstallPrompt = null;
+  ui.installHint.addEventListener('click', async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    installPrompt = null;
     ui.installHint.hidden = true;
   });
 }
 
-function populateTuningSelect() {
-  if (!ui.tuningSelect) return;
-  ui.tuningSelect.innerHTML = '';
-  TUNINGS.forEach((tuning) => {
-    const option = document.createElement('option');
-    option.value = tuning.id;
-    option.textContent = `${tuning.name} · ${tuning.desc}`;
-    if (tuning.id === state.tuningId) option.selected = true;
-    ui.tuningSelect.appendChild(option);
-  });
-}
-
 function init() {
+  // Un instrumento o afinación guardados que ya no existen vuelven al valor por defecto.
+  state.instrumentId = getInstrument(state.instrumentId).id;
+  state.tuningId = (getTuning(state.instrumentId, state.tuningId) || {}).id || 'standard';
+
   ui.appVersion.textContent = `v${APP_VERSION}`;
-  buildDial();
-  populateTuningSelect();
-  buildStringButtons();
+  applySettingsToControls();
+  renderInstrumentChips();
+  renderTuningSelect();
   bindEvents();
-  updateStringButtons();
-  updateTarget(getStringTargets(state.a4, currentStrings())[0]);
-  setIdle();
+  renderGuided();
+  renderMicButton();
+  retarget();
   setupInstallHint();
   registerServiceWorker();
-  needleLoop();
 }
 
 init();

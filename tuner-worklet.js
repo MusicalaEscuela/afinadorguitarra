@@ -6,7 +6,7 @@
 class TunerCaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const { frameSize = 8192, hop = 2048 } = options.processorOptions || {};
+    const { frameSize = 16384, hop = 2048 } = options.processorOptions || {};
     this.frameSize = frameSize;
     this.hop = hop;
     this.ring = new Float32Array(frameSize);

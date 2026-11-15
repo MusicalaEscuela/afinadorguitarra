@@ -1,7 +1,9 @@
 /*
-  Pitch detection para guitarra.
-  Usa YIN con umbral adaptado a cuerdas de guitarra estándar.
-  La meta no es adivinar cualquier ruido humano, sino medir una cuerda clara y estable.
+  Motor de detección de tono (sin DOM, se puede probar con Node).
+  1. YIN sobre audio submuestreado encuentra la nota aproximada.
+  2. Se corrige la octava revisando los armónicos.
+  3. La frecuencia exacta se mide por fase (vocoder de fase), con precisión sub-cent.
+  Funciona para cualquier instrumento: el rango de frecuencias llega como opción.
 */
 
 export function getRms(buffer) {
@@ -26,18 +28,6 @@ export function median(values) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-export function mean(values) {
-  if (!values.length) return 0;
-  return values.reduce((acc, value) => acc + value, 0) / values.length;
-}
-
-export function stdDev(values) {
-  if (values.length < 2) return 0;
-  const avg = mean(values);
-  const variance = mean(values.map((value) => (value - avg) ** 2));
-  return Math.sqrt(variance);
-}
-
 function removeDcOffset(input) {
   let sum = 0;
   for (let i = 0; i < input.length; i += 1) sum += input[i];
@@ -56,6 +46,8 @@ function parabolicInterpolation(values, tau) {
   if (!Number.isFinite(divisor) || Math.abs(divisor) < 1e-12) return tau;
   return tau + (left - right) / (2 * divisor);
 }
+
+// --- YIN: nota aproximada -----------------------------------------------------
 
 export function detectPitchYin(inputBuffer, sampleRate, options = {}) {
   const {
@@ -82,7 +74,7 @@ export function detectPitchYin(inputBuffer, sampleRate, options = {}) {
   }
 
   // Ventana fija: todos los periodos se comparan con la misma cantidad de muestras.
-  // Con una ventana variable los periodos largos (cuerdas graves) quedaban sesgados.
+  // Con una ventana variable los periodos largos (notas graves) quedaban sesgados.
   const windowSize = size - tauMax - 1;
   const diff = new Float32Array(tauMax + 2);
 
@@ -144,8 +136,6 @@ export function detectPitchYin(inputBuffer, sampleRate, options = {}) {
 }
 
 // --- Medición fina por fase ---------------------------------------------------
-// YIN encuentra la nota; luego se mide la frecuencia exacta comparando la fase de
-// cada armónico entre dos mitades del cuadro (método de vocoder de fase).
 
 const hannCache = new Map();
 function getHann(length) {
@@ -176,7 +166,7 @@ function toneAt(buffer, start, length, freq, sampleRate) {
     s = s * cosStep + c * sinStep;
     c = nc;
   }
-  return { re, im, mag: Math.hypot(re, im), phase: Math.atan2(im, re) };
+  return { mag: Math.hypot(re, im), phase: Math.atan2(im, re) };
 }
 
 function wrapPhase(value) {
@@ -184,6 +174,7 @@ function wrapPhase(value) {
 }
 
 function magnitudeAt(buffer, freq, sampleRate) {
+  if (freq >= sampleRate / 2.2) return 0;
   return toneAt(buffer, 0, buffer.length, freq, sampleRate).mag;
 }
 
@@ -200,62 +191,130 @@ export function correctOctave(buffer, pitch, sampleRate, maxFrequency) {
   return f;
 }
 
+// Refinamiento jerárquico: primero con ventanas muy cercanas (toleran un error grande
+// de la estimación inicial) y luego cada vez más separadas (dan más precisión).
 export function refinePitchByPhase(buffer, pitch, sampleRate, { harmonics = 3 } = {}) {
-  const half = Math.floor(buffer.length / 2);
-  if (half < 1024) return { pitch, coherence: 0 };
+  const length = Math.floor(buffer.length / 2);
+  if (length < 512) return { pitch, coherence: 0 };
 
   let estimate = pitch;
   let coherence = 0;
-  // Dos pasadas: la primera con el fundamental afina la estimación para que los
-  // armónicos superiores no caigan en ambigüedad de fase.
-  for (const maxHarmonic of [1, harmonics]) {
+  const hops = [length >> 4, length >> 2, length, length];
+  for (const hop of hops) {
     let weightSum = 0;
     let freqSum = 0;
-    let magSum = 0;
+    let magDiff = 0;
     let energy = 0;
-    for (let h = 1; h <= maxHarmonic; h += 1) {
+    for (let h = 1; h <= harmonics; h += 1) {
       const fh = estimate * h;
       if (fh >= sampleRate / 2.2) break;
-      const a = toneAt(buffer, 0, half, fh, sampleRate);
-      const b = toneAt(buffer, half, half, fh, sampleRate);
-      const expected = (2 * Math.PI * fh * half) / sampleRate;
+      const a = toneAt(buffer, 0, length, fh, sampleRate);
+      const b = toneAt(buffer, hop, length, fh, sampleRate);
+      const expected = (2 * Math.PI * fh * hop) / sampleRate;
       const deviation = wrapPhase(b.phase - a.phase - expected);
-      const trueFh = fh + (deviation * sampleRate) / (2 * Math.PI * half);
+      const trueFh = fh + (deviation * sampleRate) / (2 * Math.PI * hop);
       // Pesar por energía y penalizar armónicos altos (inarmonicidad de la cuerda).
       const weight = (a.mag * b.mag) / (h * h * h);
       weightSum += weight;
       freqSum += weight * (trueFh / h);
-      magSum += Math.abs(a.mag - b.mag);
+      magDiff += Math.abs(a.mag - b.mag);
       energy += a.mag + b.mag;
     }
     if (weightSum <= 0) return { pitch, coherence: 0 };
     estimate = freqSum / weightSum;
-    coherence = energy > 0 ? 1 - magSum / energy : 0;
+    coherence = energy > 0 ? 1 - magDiff / energy : 0;
   }
 
   // Si la fase da algo muy lejos de YIN, desconfiar y quedarse con YIN.
-  if (Math.abs(1200 * Math.log2(estimate / pitch)) > 40) return { pitch, coherence: 0 };
+  if (!Number.isFinite(estimate) || Math.abs(1200 * Math.log2(estimate / pitch)) > 70) {
+    return { pitch, coherence: 0 };
+  }
   return { pitch: estimate, coherence };
 }
 
-// Análisis completo de un cuadro: YIN (nota) + octava + fase (precisión).
+// --- Análisis de un cuadro ------------------------------------------------------
+
+function nearestPow2(value) {
+  return 2 ** Math.round(Math.log2(value));
+}
+
+function ceilPow2(value) {
+  return 2 ** Math.ceil(Math.log2(value));
+}
+
+// Submuestreo con filtro triangular: YIN solo necesita la nota aproximada,
+// así que puede trabajar con muchas menos muestras.
+function decimate(buffer, start, factor) {
+  if (factor <= 1) return buffer.subarray(start);
+  const count = Math.floor((buffer.length - start) / factor) - 1;
+  const out = new Float32Array(Math.max(0, count));
+  const norm = 1 / (factor * factor);
+  for (let k = 0; k < count; k += 1) {
+    const center = start + (k + 1) * factor;
+    let sum = 0;
+    for (let j = 1 - factor; j < factor; j += 1) {
+      sum += (factor - Math.abs(j)) * buffer[center + j];
+    }
+    out[k] = sum * norm;
+  }
+  return out;
+}
+
+/*
+  Análisis completo: nivel → YIN submuestreado (nota) → octava → fase (precisión).
+  El rango [minFrequency, maxFrequency] define cuánto audio se usa, y la ventana
+  de medición se adapta a la nota encontrada (larga en graves, corta en agudos).
+*/
 export function analyzeFrame(inputBuffer, sampleRate, options = {}) {
-  const { yinSize = 4096, maxFrequency = 420, expectedHz = null } = options;
-  const yinBuffer = inputBuffer.length > yinSize
-    ? inputBuffer.subarray(inputBuffer.length - yinSize)
-    : inputBuffer;
-  const coarse = detectPitchYin(yinBuffer, sampleRate, options);
-  if (!coarse.pitch) return coarse;
+  const {
+    minFrequency = 60,
+    maxFrequency = 450,
+    threshold = 0.12,
+    minRms = 0.006,
+    expectedHz = null,
+  } = options;
+  const size = inputBuffer.length;
 
-  const buffer = removeDcOffset(inputBuffer);
-  let pitch = correctOctave(buffer, coarse.pitch, sampleRate, maxFrequency);
+  // Nivel reciente (últimos ~40 ms): sirve también para detectar ataques.
+  const recent = inputBuffer.subarray(Math.max(0, size - 2048));
+  const rms = getRms(recent);
+  const peak = getPeak(recent);
+  if (rms < minRms || peak < minRms * 3) {
+    return { pitch: null, confidence: 0, rms, peak, reason: 'weak-signal' };
+  }
 
-  // Modo manual: plegar a la octava de la cuerda esperada.
+  // 1. Nota aproximada con YIN sobre audio submuestreado.
+  const factor = Math.max(1, Math.min(6, Math.floor(sampleRate / (maxFrequency * 5.5))));
+  const yinSpan = Math.min(size, ceilPow2((4 * sampleRate) / minFrequency));
+  const coarse = detectPitchYin(decimate(inputBuffer, size - yinSpan, factor), sampleRate / factor, {
+    minFrequency, maxFrequency, threshold, minRms: 0,
+  });
+  if (!coarse.pitch) return { ...coarse, rms, peak };
+
+  // 2. Ventana de medición: unas 8 vibraciones de la nota por mitad.
+  const minHalf = coarse.pitch < 500 ? 4096 : 2048;
+  const half = Math.min(Math.floor(size / 2), Math.max(minHalf, nearestPow2((8 * sampleRate) / coarse.pitch)));
+  const span = Math.min(size, half * 2);
+  const segment = removeDcOffset(inputBuffer.subarray(size - span));
+
+  // 3. Octava correcta.
+  let pitch = correctOctave(segment, coarse.pitch, sampleRate, maxFrequency);
   if (expectedHz) {
+    // Modo manual: plegar a la octava de la cuerda esperada.
     const octaves = Math.round(Math.log2(expectedHz / pitch));
     if (octaves !== 0 && Math.abs(octaves) <= 2) pitch *= 2 ** octaves;
   }
 
-  const refined = refinePitchByPhase(buffer, pitch, sampleRate);
-  return { ...coarse, pitch: refined.pitch, coarsePitch: coarse.pitch, coherence: refined.coherence };
+  // 4. Frecuencia exacta por fase.
+  const refined = refinePitchByPhase(segment, pitch, sampleRate);
+  return {
+    pitch: refined.pitch,
+    coarsePitch: coarse.pitch,
+    confidence: coarse.confidence,
+    coherence: refined.coherence,
+    rms,
+    peak,
+    spanSeconds: span / sampleRate,
+    reason: 'ok',
+  };
 }

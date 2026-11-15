@@ -1,13 +1,13 @@
 {
-  "name": "Afinador de Guitarra Musicala",
+  "name": "Afinador Musicala",
   "short_name": "MusiTuner",
-  "description": "Afinador PWA de guitarra para Musicala: simple, exacto e instalable.",
+  "description": "Afinador de Musicala para guitarra, bajo, ukelele, violín y cualquier instrumento.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait-primary",
-  "background_color": "#F6F8FF",
-  "theme_color": "#0C41C4",
+  "background_color": "#070a18",
+  "theme_color": "#070a18",
   "icons": [
     {
       "src": "assets/icon-192.png",

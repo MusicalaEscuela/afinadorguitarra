@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Afinador de Guitarra Musicala</title>
-  <meta name="description" content="Afinador PWA de guitarra para Musicala: preciso, simple e instalable." />
+  <title>Afinador Musicala</title>
+  <meta name="description" content="Afinador de Musicala para guitarra, bajo, ukelele, violín y cualquier instrumento: preciso, simple e instalable." />
   <meta name="theme-color" content="#070a18" />
   <meta name="color-scheme" content="dark" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="MusiTuner" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="icon" type="image/png" href="assets/icon-192.png" />
   <link rel="apple-touch-icon" href="assets/icon-192.png" />
@@ -18,143 +18,125 @@
 </head>
 <body>
   <div class="app-shell">
-    <header class="hero">
-      <div class="brand-block">
-        <img src="assets/logo.png" alt="Musicala" class="logo" />
-        <div>
-          <p class="eyebrow">Afinador PWA</p>
-          <h1>Afinador de Guitarra <span>Musicala</span></h1>
-        </div>
+    <header class="top-bar">
+      <div class="brand">
+        <img src="assets/logo.png" alt="" class="logo" />
+        <h1>Afinador <span>Musicala</span></h1>
       </div>
-      <div class="version" id="appVersion">v3</div>
+      <button id="btnSettings" class="icon-button" type="button" aria-expanded="false" aria-controls="settingsPanel">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M16 4.5v5M8 14.5v5" /></svg>
+        <span>Ajustes</span>
+      </button>
     </header>
 
-    <main class="layout">
-      <section class="panel controls-panel" aria-labelledby="controlsTitle">
-        <div class="panel-header">
-          <h2 id="controlsTitle">Control</h2>
-          <button id="btnReset" class="ghost-button" type="button">Restablecer</button>
+    <nav id="instrumentChips" class="chips" aria-label="Instrumento"></nav>
+
+    <section id="settingsPanel" class="settings" hidden>
+      <label class="field" id="tuningField">
+        <span>Afinación</span>
+        <select id="tuningSelect"></select>
+      </label>
+
+      <label class="field">
+        <span>Tolerancia</span>
+        <select id="toleranceSelect">
+          <option value="2">Estudio · ±2 cents</option>
+          <option value="3">Pro · ±3 cents</option>
+          <option value="5" selected>Estándar · ±5 cents</option>
+          <option value="8">Principiante · ±8 cents</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Calibración La4 · <strong><span id="a4Value">440</span> Hz</strong></span>
+        <input id="a4Input" type="range" min="430" max="450" step="1" value="440" />
+      </label>
+
+      <label class="field">
+        <span>Nombres de notas</span>
+        <select id="namingSelect">
+          <option value="letters">C D E F G A B</option>
+          <option value="latin">Do Re Mi Fa Sol La Si</option>
+        </select>
+      </label>
+
+      <label class="field toggle-field">
+        <span>Sonido al afinar</span>
+        <span class="switch">
+          <input id="soundToggle" type="checkbox" checked />
+          <span class="switch-track" aria-hidden="true"></span>
+        </span>
+      </label>
+
+      <button id="btnReset" class="ghost-button" type="button">Restablecer ajustes</button>
+    </section>
+
+    <main id="displayCard" class="tuner is-quiet">
+      <div class="target-row">
+        <div>
+          <p class="eyebrow" id="targetEyebrow">Objetivo</p>
+          <h2 id="targetLabel">6ª cuerda · E2</h2>
         </div>
-
-        <button id="btnMic" class="primary-button" type="button">Activar micrófono</button>
-        <p id="permissionHint" class="hint">Funciona en HTTPS, como GitHub Pages. En archivo local el micrófono suele bloquearse, porque los navegadores aman complicar lo obvio.</p>
-
-        <div class="field-grid">
-          <label class="field">
-            <span>Afinación</span>
-            <select id="tuningSelect"></select>
-          </label>
-
-          <label class="field">
-            <span>Calibración A4</span>
-            <div class="inline-control">
-              <input id="a4Input" type="range" min="430" max="450" step="1" value="440" />
-              <strong><span id="a4Value">440</span> Hz</strong>
-            </div>
-          </label>
-
-          <label class="field">
-            <span>Tolerancia</span>
-            <select id="toleranceSelect">
-              <option value="3">Pro · ±3 cents</option>
-              <option value="5" selected>Estándar · ±5 cents</option>
-              <option value="8">Principiante · ±8 cents</option>
-            </select>
-          </label>
-
-          <label class="field toggle-field">
-            <span>Sonido al afinar</span>
-            <label class="switch">
-              <input id="soundToggle" type="checkbox" checked />
-              <span class="switch-track" aria-hidden="true"></span>
-            </label>
-          </label>
+        <div class="target-actions">
+          <span id="targetFrequency">82.41 Hz</span>
+          <button id="btnReference" class="pill-button" type="button">▶ Tono guía</button>
         </div>
+      </div>
 
-        <div class="strings-head">
-          <h3>Cuerda</h3>
-          <p id="modeLabel">Automático</p>
+      <div class="dial-wrap">
+        <svg class="dial" viewBox="0 0 320 200" role="img" aria-label="Medidor de afinación en cents">
+          <path id="dialRim" class="dial-rim" />
+          <path id="dialZone" class="dial-zone" />
+          <g id="dialTicks"></g>
+          <g id="needle" class="dial-needle">
+            <line x1="160" y1="112" x2="160" y2="50" />
+            <circle cx="160" cy="50" r="5" />
+          </g>
+        </svg>
+        <span class="side-hint low">♭ baja</span>
+        <span class="side-hint high">alta ♯</span>
+
+        <div class="readout" aria-live="polite">
+          <div class="note"><span id="detectedNote">--</span><sub id="detectedOctave"></sub></div>
+          <div class="cents"><strong id="centsValue">0.0</strong> cents</div>
+          <div class="hz" id="detectedFrequency">— Hz</div>
         </div>
-        <div id="stringButtons" class="string-buttons" aria-label="Selector de cuerda"></div>
+      </div>
 
-        <button id="btnGuided" class="guided-button" type="button">Modo guiado</button>
-      </section>
+      <div class="result">
+        <p id="precisionText">Esperando señal</p>
+        <h3 id="advice">Activa el micrófono y toca una nota.</h3>
+      </div>
 
-      <section id="displayCard" class="panel tuner-card is-quiet" aria-live="polite">
-        <div class="target-row">
-          <div>
-            <p class="eyebrow">Objetivo</p>
-            <h2 id="targetString">6ª cuerda · E2</h2>
-          </div>
-          <div class="target-actions">
-            <strong id="targetFrequency">82.41 Hz</strong>
-            <button id="btnReference" class="reference-button" type="button">▶ Tono guía</button>
-          </div>
-        </div>
+      <div id="guidedPanel" class="guided-panel" hidden>
+        <p id="guidedInstruction" class="guided-instruction"></p>
+      </div>
 
-        <div id="guidedPanel" class="guided-panel" hidden>
-          <div id="guidedProgress" class="guided-progress" aria-label="Progreso de afinación"></div>
-          <p id="guidedInstruction" class="guided-instruction">Toca la 6ª cuerda (E2) y afínala.</p>
-        </div>
+      <div id="stringsBlock" class="strings-block">
+        <div id="stringButtons" class="string-buttons" aria-label="Cuerda"></div>
+        <p id="modeLabel" class="mode-label"></p>
+      </div>
 
-        <div class="dial-wrap" aria-label="Medidor de afinación en cents">
-          <svg class="dial" viewBox="0 0 320 215" role="img" aria-hidden="true">
-            <defs>
-              <linearGradient id="needleGrad" x1="0" y1="1" x2="0" y2="0">
-                <stop offset="0%" stop-color="#2d7dff" />
-                <stop offset="100%" stop-color="#72d8ff" />
-              </linearGradient>
-            </defs>
-            <path id="dialRim" class="dial-rim" />
-            <path id="dialZone" class="dial-zone" />
-            <g id="dialTicks"></g>
-            <g id="needle" class="dial-needle">
-              <line x1="160" y1="190" x2="160" y2="58" />
-              <circle cx="160" cy="190" r="9" />
-            </g>
-          </svg>
+      <div class="actions">
+        <button id="btnMic" class="primary-button" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3" /></svg>
+          <span id="btnMicLabel">Activar micrófono</span>
+        </button>
+        <button id="btnGuided" class="secondary-button" type="button">Modo guiado</button>
+      </div>
+      <p id="permissionHint" class="hint"></p>
 
-          <div class="dial-center">
-            <p class="eyebrow">Detectado</p>
-            <div id="detectedNote" class="detected-note">--</div>
-            <div class="readout-stack">
-              <span id="detectedFrequency">0.00 Hz</span>
-              <strong><span id="centsValue">0.0</span> cents</strong>
-            </div>
-          </div>
-
-          <div id="needleReadout" class="needle-readout">0.0 cents</div>
-        </div>
-
-        <div class="result-box">
-          <p id="precisionText">Esperando señal</p>
-          <h3 id="advice">Activa el micrófono y toca una sola cuerda.</h3>
-        </div>
-
-        <div class="quality-grid" aria-label="Calidad de lectura">
-          <div class="quality-item">
-            <span>Señal</span>
-            <div class="mini-meter"><div id="signalFill"></div></div>
-            <strong id="signalText">sin señal</strong>
-          </div>
-          <div class="quality-item">
-            <span>Tono</span>
-            <div class="mini-meter"><div id="confidenceFill"></div></div>
-            <strong id="confidenceText">sin lectura</strong>
-          </div>
-          <div class="quality-item">
-            <span>Estabilidad</span>
-            <div class="mini-meter"><div id="stabilityFill"></div></div>
-            <strong id="stabilityText">sin estabilidad</strong>
-          </div>
-        </div>
-      </section>
+      <div class="quality" aria-label="Calidad de lectura">
+        <div class="quality-item"><span>Señal</span><div class="mini-meter"><div id="signalFill"></div></div></div>
+        <div class="quality-item"><span>Claridad</span><div class="mini-meter"><div id="confidenceFill"></div></div></div>
+        <div class="quality-item"><span>Estabilidad</span><div class="mini-meter"><div id="stabilityFill"></div></div></div>
+      </div>
     </main>
 
     <button id="installHint" class="install-button" hidden type="button">Instalar afinador</button>
 
     <footer class="footer">
-      <strong>Consejo rápido:</strong> toca una cuerda a la vez, deja sonar la nota y ajusta en movimientos pequeños. La guitarra no negocia con la impaciencia, qué cosa tan sana.
+      Toca una sola nota, déjala sonar y ajusta poco a poco. <span id="appVersion"></span>
     </footer>
   </div>
 
